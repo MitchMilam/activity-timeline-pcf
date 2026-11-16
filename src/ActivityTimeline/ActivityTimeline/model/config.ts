@@ -27,6 +27,16 @@ export interface FeedSort {
 }
 export type Density = "comfortable" | "compact";
 
+/**
+ * How far down the timeline reaches, as in the built-in timeline's "Activity rollup type": none = the record's own
+ * activities; related = also those of records directly below it; extended = every level below. Which related tables
+ * count is set per relationship in Dataverse (its Rollup View behaviour).
+ */
+export type RollupType = "none" | "related" | "extended";
+
+/** The tables Dataverse can roll activities up to. Elsewhere it answers "Rollup on <table> is not supported". */
+export const ROLLUP_TABLES = ["account", "contact", "opportunity", "lead"];
+
 export type TypeColor =
     | "blue" | "green" | "marigold" | "grape" | "teal" | "cranberry" | "steel"
     | "pumpkin" | "lavender" | "forest" | "cornflower" | "brown" | "pink" | "anchor";
@@ -65,6 +75,8 @@ export interface TimelineConfig {
     activityTypes: string[];
     includeNotes: boolean;
     includeParties: boolean;
+    /** Only applies on ROLLUP_TABLES; elsewhere the timeline shows the record's own activities */
+    rollup: RollupType;
     sortBy: SortColumn;
     notesSortBy: NoteSortColumn;
     sortOrder: SortOrder;
@@ -87,6 +99,7 @@ export interface RawConfig {
     activityTypes?: string | null;
     includeNotes?: string | null;
     relatedScope?: string | null;
+    rollupType?: string | null;
     sortBy?: string | null;
     notesSortBy?: string | null;
     sortOrder?: string | null;
@@ -123,8 +136,16 @@ function clamp(value: number | null | undefined, min: number, max: number, fallb
     return Math.min(max, Math.max(min, Math.round(value)));
 }
 
-export function parseConfig(raw: RawConfig): TimelineConfig {
+/** `entity` is the table of the form the control sits on, when known */
+export function parseConfig(raw: RawConfig, entity?: string): TimelineConfig {
     const warnings: string[] = [];
+
+    const rollup: RollupType = raw.rollupType === "related" || raw.rollupType === "extended" ? raw.rollupType : "none";
+    if (rollup !== "none" && entity && !ROLLUP_TABLES.includes(entity)) {
+        warnings.push(
+            `Activity rollup type works on ${ROLLUP_TABLES.join(", ")} only. On ${entity} the timeline shows the record's own activities.`,
+        );
+    }
 
     let advanced: AdvancedConfig = {};
     const json = raw.advancedConfig?.trim();
@@ -155,6 +176,7 @@ export function parseConfig(raw: RawConfig): TimelineConfig {
         activityTypes: parseList(raw.activityTypes === "val" ? null : raw.activityTypes, DEFAULT_TYPES),
         includeNotes: flag(raw.includeNotes, true),
         includeParties: raw.relatedScope !== "regarding",
+        rollup,
         sortBy,
         // The built-in timeline sorts notes by modified on unless told otherwise
         notesSortBy: raw.notesSortBy === "createdon" ? "createdon" : "modifiedon",

@@ -15,7 +15,7 @@ src/ActivityTimeline/            The PCF control (React virtual control, Fluent 
     index.ts                     Entry point: reads the configuration and record, picks the data source
     model/                       Pure logic: configuration, dates (user's Dataverse time zone), HTML handling,
                                  feed grouping and threading, activity type defaults, strings
-    data/DataverseDataSource.ts  Web API queries, mapping, actions, navigation
+    data/DataverseDataSource.ts  FetchXML and Web API queries, rollup, mapping, actions, navigation
     data/SampleDataSource.ts     Sample data for the local test harness (left out of production builds)
     data/dataSource.ts           Data source contract, MergedPager (merges paged queries in date order) and
                                  HydratingPager (loads bodies and participants for shown items only)
@@ -78,19 +78,32 @@ To add a language:
 
 Queries per load:
 
-1. **Counts**: three FetchXML aggregates (activities per type and state, overdue per type, notes). The participant
-   check uses `link-type="any"`, so an activity with several matching parties is counted once. FetchXML returns
-   types as object type codes; system codes are built in, custom ones come from metadata. The counts also tell the
-   feed which queries it can skip.
-2. **Feed**: per kind of date (created, start, due, completed), a paged light `activitypointer` query, plus a paged
-   `annotation` query. `MergedPager` merges them in date order. Filters and search run in Dataverse, so paging
-   stays correct.
+Every activity query is FetchXML, built in one place. The record's own activities run as a Web API query
+(`activitypointers?fetchXml=…`), scoped by one condition: `regardingobjectid`, or with participants a
+`link-type="any"` link to `activityparty` on `partyid`. Dataverse keeps an activity's regarding record among its
+parties too, so that one indexed condition covers both, and an activity with several matching parties comes once.
+With a rollup the query goes through `RetrieveTimelineWallRecords` instead, Dataverse adds the scope, and the
+rows come back in the SDK's shape and are converted. FetchXML compares types by object type code; system codes are
+built in, custom ones come from metadata.
+
+Queries per load:
+
+1. **Activities**: one light `activitypointer` query, newest first, `count` 100, with each email's
+   `attachmentcount` joined in. When it holds every activity (most records), counts, overdue, the *Upcoming*
+   section, filters and paging are worked out from it in memory, and step 2 doesn't run. **Notes**: one aggregate
+   for the count and one paged `annotation` query.
+2. **Large records** (more than 100): two FetchXML aggregates (activities per type and state, overdue per type)
+   and per kind of date (created, start, due, completed) a paged light query, side by side. `MergedPager` merges
+   them in date order; filters and search run in Dataverse, so paging stays correct. The counts tell later loads
+   which queries they can skip. The record is kept in `sessionStorage`, so its next load starts here.
 3. **Details** for the shown items: `activitypointer` by id with `activitypointer_activity_parties` expanded
-   (25 per query), `activitymimeattachment` ids for attachment counts, and status labels from metadata.
+   (25 per query), `activitymimeattachment` ids for appointments' attachment counts, and status labels from
+   metadata. Kept while the form is open; **Refresh** and saving the item drop them.
 4. **Preview**: one `retrieveRecord` for the configured columns, plus attachment metadata. File bodies load only
    for image previews (up to 3 MB) and downloads.
 
-If an environment rejects the participant filter, the control falls back to regarding-only automatically.
+If Dataverse refuses a query's scope, the control narrows it for the session and runs it again: rollup → the
+record's own activities → regarding only.
 
 Security: email and rich-text bodies render in an iframe without `allow-scripts`, with a Content Security Policy
 that blocks everything except inline styles and, when allowed, images.

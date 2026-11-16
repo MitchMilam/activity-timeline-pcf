@@ -166,7 +166,7 @@ export function useTimeline(source: TimelineDataSource, config: TimelineConfig, 
             if (!record) return;
             const request = ++requestRef.current;
             setState((s) => ({ ...s, loading: mode, error: undefined, searchLimit: undefined }));
-            // Counts first: the feed uses them to skip queries for kinds of activity the record doesn't have
+            // Counts and feed load side by side; once counts are in, later loads skip kinds of activity the record doesn't have
             if (withCounts) {
                 source.getCounts()
                     .then((counts) => setState((s) => ({ ...s, counts })))

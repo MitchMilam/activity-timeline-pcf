@@ -1,6 +1,6 @@
 import { IInputs } from "../generated/ManifestTypes";
 import { canComplete, canEdit, dateRule, eventDate, mapPriority, mapState, previewColumns, quickEdit, ruledTypes, withStatusDetails } from "../model/activityTypes";
-import { allowsAllTypes, DateRule, FeedSort, SortColumn, SortOrder, TimelineConfig } from "../model/config";
+import { allowsAllTypes, DateRule, FeedSort, ROLLUP_TABLES, RollupType, SortColumn, SortOrder, TimelineConfig } from "../model/config";
 import { DateEnv, formatFull } from "../model/dates";
 import { applyChanges } from "../model/edit";
 import { compareByDate, isOpenState } from "../model/feed";
@@ -21,15 +21,26 @@ const DETAILS_CHUNK = 25;
 const PREVIEW_WIDTH = 560;
 
 /** What the feed queries load: enough to place, sort and label an item. Bodies and participants follow for shown items only. */
-const LIGHT_SELECT = [
+const FEED_COLUMNS = [
     "activityid", "activitytypecode", "subject", "statecode", "statuscode", "prioritycode",
     "scheduledstart", "scheduledend", "actualend", "actualdurationminutes", "createdon", "modifiedon", "sortdate",
-    "senton", "_ownerid_value", "_createdby_value",
-].join(",");
+    "senton", "ownerid", "createdby",
+];
+/** The same columns for a Web API query of one activity */
+const LIGHT_SELECT = FEED_COLUMNS.map((c) => (c === "ownerid" || c === "createdby" ? `_${c}_value` : c)).join(",");
+/** Emails keep their attachment count, so it comes along with the feed; other types are counted when shown */
+const EMAIL_ATTACHMENTS = "email_attachmentcount";
 const PARTY_EXPAND = "activitypointer_activity_parties($select=participationtypemask,_partyid_value,addressused)";
 const NOTE_SELECT = "annotationid,subject,notetext,filename,filesize,mimetype,isdocument,createdon,modifiedon,_createdby_value,_ownerid_value";
 /** When sorting by activity date, an activity can sit at any of these */
 const EVENT_DATE_COLUMNS: SortColumn[] = ["createdon", "scheduledstart", "scheduledend", "actualend"];
+/**
+ * A record with up to this many activities gets them all in one query, and its counts, feed and filters work from that.
+ * A larger record pages through one query per date column instead.
+ */
+const SNAPSHOT_LIMIT = 100;
+/** Records found to have more, kept for the browser session so they go straight to paging */
+const LARGE_RECORDS = "rsn-activitytimeline:large";
 
 // --- value helpers ----------------------------------------------------------------------------------------
 
@@ -73,31 +84,121 @@ function searchLiteral(term: string): string {
     return encodeURIComponent(odataString(term.trim().replace(/[%_[]/g, "[$&]")));
 }
 
+/** A search term as a FetchXML like pattern: found anywhere, with wildcard characters matching literally */
+function likePattern(term: string): string {
+    return `%${term.trim().replace(/[%_[]/g, "[$&]")}%`;
+}
+
 function xmlValue(value: string): string {
     return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-const OPEN = "(statecode eq 0 or statecode eq 3)";
-const CLOSED = "(statecode eq 1 or statecode eq 2)";
+// --- FetchXML -------------------------------------------------------------------------------------------
+// Activity queries are FetchXML, so the same query runs on the record's own activities and through Dataverse's rollup.
 
-function anyOf(conditions: (string | undefined)[]): string | undefined {
-    const list = conditions.filter((c): c is string => !!c);
-    return list.length <= 1 ? list[0] : `(${list.join(" or ")})`;
+/** A FetchXML filter part: a condition, a filter, or a link-entity inside a filter */
+type Cond = string;
+
+function condition(attribute: string, operator: string, value?: string | number): Cond {
+    return value === undefined
+        ? `<condition attribute="${attribute}" operator="${operator}" />`
+        : `<condition attribute="${attribute}" operator="${operator}" value="${xmlValue(String(value))}" />`;
 }
 
-function allOf(conditions: (string | undefined)[]): string | undefined {
-    const list = conditions.filter((c): c is string => !!c);
-    return list.length <= 1 ? list[0] : `(${list.join(" and ")})`;
+/** A condition no row meets, for a list of types none of which exist */
+const NOTHING = condition("activityid", "null");
+
+function valuesIn(attribute: string, values: (string | number)[], operator: "in" | "not-in" = "in"): Cond {
+    return `<condition attribute="${attribute}" operator="${operator}">${values.map((v) => `<value>${xmlValue(String(v))}</value>`).join("")}</condition>`;
 }
 
-function typeIn(types: string[]): string {
-    return anyOf(types.map((t) => `activitytypecode eq ${odataString(t)}`)) ?? "false";
+function group(type: "and" | "or", conditions: (Cond | undefined)[]): Cond | undefined {
+    const list = conditions.filter((c): c is Cond => !!c);
+    return list.length <= 1 ? list[0] : `<filter type="${type}">${list.join("")}</filter>`;
 }
+
+const anyOf = (conditions: (Cond | undefined)[]) => group("or", conditions);
+const allOf = (conditions: (Cond | undefined)[]) => group("and", conditions);
+
+const OPEN = valuesIn("statecode", [0, 3]);
+const CLOSED = valuesIn("statecode", [1, 2]);
+
+/** Type codes by logical name; a type with no code has no table, so nothing can be of it */
+type TypeCodes = Map<string, number>;
+
+function codesOf(types: string[], codes: TypeCodes): number[] {
+    return types.flatMap((t) => {
+        const code = codes.get(t);
+        return code === undefined ? [] : [code];
+    });
+}
+
+/** FetchXML compares activity types by object type code, not by name */
+function typeIn(types: string[], codes: TypeCodes): Cond {
+    const values = codesOf(types, codes);
+    return values.length > 0 ? valuesIn("activitytypecode", values) : NOTHING;
+}
+
+function typeNotIn(types: string[], codes: TypeCodes): Cond | undefined {
+    const values = codesOf(types, codes);
+    return values.length > 0 ? valuesIn("activitytypecode", values, "not-in") : undefined;
+}
+
+/** Where a page of a FetchXML query starts */
+interface PageCursor {
+    page: number;
+    cookie?: string;
+}
+
+/** One FetchXML query on activities, before the record's scope is added */
+interface ActivityFetch {
+    filter?: Cond;
+    orders: [string, SortOrder][];
+    count: number;
+    page?: PageCursor;
+    /** Whether rows can be emails, so their attachment count comes along */
+    emails?: boolean;
+    columns?: string[];
+}
+
+/** One page of a FetchXML query, in the Web API's row shape, and whether there's more */
+interface FetchPage {
+    rows: Row[];
+    more: boolean;
+    cookie?: string;
+}
+
+/**
+ * Which activities a query covers. rollup: Dataverse's timeline rollup for the record (RetrieveTimelineWallRecords);
+ * parties: regarding the record or with the record as a participant; regarding: regarding the record only.
+ */
+type Scope = "rollup" | "parties" | "regarding";
+
+/** Every activity in scope as light rows, newest first; only for records with no more than SNAPSHOT_LIMIT */
+interface Snapshot {
+    rows: Row[];
+    scope: Scope;
+}
+
+/** The feed's two sections built from a snapshot, in display order */
+interface MemoryFeed {
+    history: TimelineItem[];
+    upcoming: TimelineItem[];
+}
+
+const ROLLUP_CODES: Record<RollupType, number> = { none: 0, related: 1, extended: 2 };
+
+const WEB_API_HEADERS = {
+    Accept: "application/json",
+    "OData-MaxVersion": "4.0",
+    "OData-Version": "4.0",
+    Prefer: 'odata.include-annotations="*"',
+};
 
 /** One query of the feed: some activity types in some states, ordered by one date column. */
 interface Slice {
     column: SortColumn;
-    condition?: string;
+    condition?: (codes: TypeCodes) => Cond | undefined;
     /** States the slice can hold, so a status filter can leave it out */
     states: "open" | "closed" | "any";
     /** Types it can hold, so it's skipped when the record has none; undefined = any type */
@@ -108,8 +209,8 @@ interface Slice {
 interface TypeStates {
     rows: { entity: string; label: string; open: boolean; count: number }[];
     notes: number;
-    /** False when counting fell back to regarding only; such counts can't rule out participant activities */
-    withParties: boolean;
+    /** What the counts covered; they can only rule out queries in the same scope */
+    scope: Scope;
     /** False when some counted type couldn't be named; then nothing is ruled out */
     complete: boolean;
 }
@@ -123,6 +224,61 @@ const SYSTEM_TYPE_CODES: Record<number, string> = {
     4209: "orderclose", 4210: "phonecall", 4211: "quoteclose", 4212: "task", 4214: "serviceappointment", 4216: "socialactivity",
     4251: "recurringappointmentmaster", 4401: "campaignresponse", 4402: "campaignactivity", 4406: "bulkoperation",
 };
+const SYSTEM_CODES_BY_NAME: TypeCodes = new Map(Object.entries(SYSTEM_TYPE_CODES).map(([code, name]) => [name, Number(code)]));
+const EMAIL_CODE = 4202;
+
+// --- rollup results -------------------------------------------------------------------------------------
+
+/** An entity as RetrieveTimelineWallRecords returns it: the SDK's shape, serialized */
+interface SdkEntity {
+    Attributes?: { Key: string; Value: unknown }[];
+    FormattedValues?: { Key: string; Value: string }[];
+}
+
+interface SdkReference {
+    Id: string;
+    LogicalName: string;
+    Name?: string | null;
+}
+
+function isReference(value: unknown): value is SdkReference {
+    return !!value && typeof value === "object" && "Id" in value && "LogicalName" in value;
+}
+
+/** Aliased values (link-entity columns, aggregates) and option set values are wrapped in { Value } */
+function unwrap(value: unknown): unknown {
+    let v = value;
+    while (v && typeof v === "object" && !Array.isArray(v) && "Value" in v && !isReference(v)) v = (v as { Value: unknown }).Value;
+    return v;
+}
+
+/** Puts a rolled-up row in the Web API's shape, so one mapping serves both kinds of query */
+function webApiRow(entity: SdkEntity): Row {
+    const row: Row = {};
+    const lookups = new Set<string>();
+    for (const { Key, Value } of entity.Attributes ?? []) {
+        const value = unwrap(Value);
+        if (isReference(value)) {
+            row[`_${Key}_value`] = value.Id;
+            row[`_${Key}_value${LOOKUP_TYPE}`] = value.LogicalName;
+            if (value.Name) row[`_${Key}_value${FORMATTED}`] = value.Name;
+            lookups.add(Key);
+        } else {
+            row[Key] = value;
+        }
+    }
+    for (const { Key, Value } of entity.FormattedValues ?? []) {
+        row[`${lookups.has(Key) ? `_${Key}_value` : Key}${FORMATTED}`] = Value;
+    }
+    return row;
+}
+
+/** The Web API returns the paging cookie wrapped and URL-encoded twice; FetchXML wants the cookie itself */
+function pagingCookie(annotation: unknown): string | undefined {
+    if (typeof annotation !== "string") return undefined;
+    const encoded = /pagingcookie="([^"]*)"/.exec(annotation)?.[1];
+    return encoded ? decodeURIComponent(decodeURIComponent(encoded)) : undefined;
+}
 
 const INTERNAL_PARTY_TYPES = new Set(["systemuser", "queue", "team"]);
 
@@ -158,8 +314,8 @@ interface XrmWindow {
 export class DataverseDataSource implements TimelineDataSource {
     public readonly currentUserId: string;
     private readonly metadataCache = new Map<string, Promise<MetadataLike | undefined>>();
-    /** Switched off if the environment rejects the participant query, so the timeline still loads by regarding */
-    private useParties: boolean;
+    /** Narrowed for the rest of the session when Dataverse refuses a scope, so the timeline still loads */
+    private scope: Scope;
 
     constructor(
         private readonly context: ComponentFramework.Context<IInputs>,
@@ -169,27 +325,126 @@ export class DataverseDataSource implements TimelineDataSource {
         private readonly labels: { note: string; untitled: string },
     ) {
         this.currentUserId = normalizeId(context.userSettings.userId ?? "");
-        this.useParties = config.includeParties;
+        this.scope = config.rollup !== "none" && ROLLUP_TABLES.includes(record.entity) ? "rollup" : this.ownScope();
     }
 
     // --- queries ------------------------------------------------------------------------------------------
 
-    /** Runs an activity query; if the participant filter is rejected, retries once with regarding only. */
-    private async queryActivities(build: () => string, pageSize: number): Promise<ComponentFramework.WebApi.RetrieveMultipleResponse> {
+    /** The record's own activities, as the form is configured */
+    private ownScope(): Scope {
+        return this.config.includeParties ? "parties" : "regarding";
+    }
+
+    /** The scope to retry with when Dataverse refuses one */
+    private narrower(scope: Scope): Scope | undefined {
+        if (scope === "rollup") return this.ownScope();
+        return scope === "parties" ? "regarding" : undefined;
+    }
+
+    /**
+     * The scope as a filter part; with rollup Dataverse adds it. Dataverse keeps an activity's regarding record among its
+     * parties too (participation type Regarding), so one indexed condition on parties covers both, as in the built-in
+     * timeline. "any" checks parties without multiplying rows.
+     */
+    private scopeCondition(scope: Scope): Cond | undefined {
+        if (scope === "rollup") return undefined;
+        const id = normalizeId(this.record.id);
+        if (scope === "regarding") return condition("regardingobjectid", "eq", id);
+        return `<link-entity name="activityparty" from="activityid" to="activityid" link-type="any"><filter>${condition("partyid", "eq", id)}</filter></link-entity>`;
+    }
+
+    /**
+     * Runs an activity query in the current scope. When Dataverse refuses the scope (rollup on a table it can't roll
+     * up, or the participant filter), the rest of the session uses the next narrower one, and the query runs again.
+     */
+    private async queryActivities(build: (scope: Cond | undefined, rollup: boolean) => string): Promise<FetchPage & { scope: Scope }> {
+        const scope = this.scope;
         try {
-            return await this.context.webAPI.retrieveMultipleRecords("activitypointer", build(), pageSize);
+            const rollup = scope === "rollup";
+            return { ...(await this.runFetch(build(this.scopeCondition(scope), rollup), rollup)), scope };
         } catch (e) {
-            if (!this.useParties) throw e;
-            this.useParties = false;
-            return this.context.webAPI.retrieveMultipleRecords("activitypointer", build(), pageSize);
+            const narrower = this.narrower(scope);
+            if (!narrower || !(e as { rejected?: boolean }).rejected) throw e;
+            // Queries run side by side; one of the others may have narrowed it already
+            if (this.scope === scope) this.scope = narrower;
+            return this.queryActivities(build);
         }
     }
 
-    private scopeFilter(): string {
-        const id = normalizeId(this.record.id);
-        return this.useParties
-            ? `(_regardingobjectid_value eq ${id} or activitypointer_activity_parties/any(p:p/_partyid_value eq ${id}))`
-            : `_regardingobjectid_value eq ${id}`;
+    /** Runs FetchXML on activities: as a Web API query, or through the rollup the built-in timeline uses */
+    private async runFetch(fetchXml: string, rollup: boolean): Promise<FetchPage> {
+        const url = rollup
+            ? "/api/data/v9.2/activitypointers/Microsoft.Dynamics.CRM.RetrieveTimelineWallRecords(FetchXml=@xml,Target=@target,RollupType=@type)" +
+              `?@xml=${encodeURIComponent(odataString(fetchXml))}&@target=${encodeURIComponent(await this.rollupTarget())}&@type=${ROLLUP_CODES[this.config.rollup]}`
+            : `/api/data/v9.2/activitypointers?fetchXml=${encodeURIComponent(fetchXml)}`;
+        // context.webAPI can't call functions, so both go through fetch, the same way
+        const response = await fetch(url, { headers: WEB_API_HEADERS, credentials: "same-origin" });
+        const body = (await response.json().catch(() => ({}))) as Row;
+        if (!response.ok) {
+            const message = (body.error as { message?: string } | undefined)?.message ?? `Dataverse answered ${response.status}.`;
+            // 400: Dataverse refused the query itself, so a narrower scope can still work
+            throw Object.assign(new Error(message), { rejected: response.status === 400 });
+        }
+        if (rollup) {
+            const collection = JSON.parse(typeof body.TimelineWallRecords === "string" ? body.TimelineWallRecords : "{}") as {
+                Entities?: SdkEntity[];
+                MoreRecords?: boolean;
+                PagingCookie?: string | null;
+            };
+            return { rows: (collection.Entities ?? []).map(webApiRow), more: collection.MoreRecords === true, cookie: collection.PagingCookie ?? undefined };
+        }
+        return {
+            rows: (body.value as Row[] | undefined) ?? [],
+            more: body["@Microsoft.Dynamics.CRM.morerecords"] === true,
+            cookie: pagingCookie(body["@Microsoft.Dynamics.CRM.fetchxmlpagingcookie"]),
+        };
+    }
+
+    /** The record, as the rollup's Target parameter */
+    private async rollupTarget(): Promise<string> {
+        const entitySet = (await this.metadata(this.record.entity, []))?.EntitySetName;
+        if (!entitySet) throw Object.assign(new Error(`Couldn't find the entity set for ${this.record.entity}.`), { rejected: true });
+        return `{'@odata.id':'${entitySet}(${normalizeId(this.record.id)})'}`;
+    }
+
+    /** One FetchXML query on activities, with the scope added */
+    private activityFetch(q: ActivityFetch, scope: Cond | undefined, rollup: boolean): string {
+        const paging = q.page ? ` page="${q.page.page}"${q.page.cookie ? ` paging-cookie="${xmlValue(q.page.cookie)}"` : ""}` : "";
+        // An activity can be related to the record more than one way; the built-in timeline asks for it once, too
+        const distinct = rollup ? ` distinct="true"` : "";
+        const columns = (q.columns ?? FEED_COLUMNS).map((c) => `<attribute name="${c}" />`).join("");
+        const orders = q.orders.map(([c, o]) => `<order attribute="${c}" descending="${o === "desc"}" />`).join("");
+        const emails = q.emails
+            ? `<link-entity name="email" from="activityid" to="activityid" link-type="outer" alias="email"><attribute name="attachmentcount" alias="${EMAIL_ATTACHMENTS}" /></link-entity>`
+            : "";
+        const filter = allOf([scope, q.filter]);
+        return `<fetch count="${q.count}"${paging}${distinct}><entity name="activitypointer">${columns}${orders}${emails}` +
+            `${filter ? `<filter type="and">${filter}</filter>` : ""}</entity></fetch>`;
+    }
+
+    private readonly codeCache = new Map<string, Promise<number | undefined>>();
+
+    /** Type codes for activity types by name: fixed for system tables, from cached metadata for custom ones */
+    private async codesFor(types: Iterable<string>): Promise<TypeCodes> {
+        const names = Array.from(new Set(types));
+        const codes = await Promise.all(
+            names.map((name) => {
+                const known = SYSTEM_CODES_BY_NAME.get(name);
+                if (known !== undefined) return Promise.resolve(known);
+                let code = this.codeCache.get(name);
+                if (!code) {
+                    code = this.metadata(name, []).then((md) => (md as { ObjectTypeCode?: number } | undefined)?.ObjectTypeCode);
+                    this.codeCache.set(name, code);
+                }
+                return code;
+            }),
+        );
+        const map: TypeCodes = new Map();
+        names.forEach((name, i) => {
+            const code = codes[i];
+            if (typeof code === "number") map.set(name, code);
+        });
+        return map;
     }
 
     /** Activity types to query: configured types, narrowed by the user's type filter. Undefined = all types. */
@@ -202,13 +457,28 @@ export class DataverseDataSource implements TimelineDataSource {
         return configured;
     }
 
-    private dateFilter(filters: TimelineFilters, column: string): string[] {
+    /** The date filter's window, or undefined for any date */
+    private dateWindow(filters: TimelineFilters): { from: string; to: string } | undefined {
         const f = filters.date;
-        if (f.kind === "last") {
-            const now = this.env.now();
-            return [`${column} ge ${new Date(now.getTime() - f.days * 86400000).toISOString()}`, `${column} le ${now.toISOString()}`];
-        }
-        return [];
+        if (f.kind !== "last") return undefined;
+        const now = this.env.now();
+        return { from: new Date(now.getTime() - f.days * 86400000).toISOString(), to: now.toISOString() };
+    }
+
+    /** The date filter for notes, in OData */
+    private dateFilter(filters: TimelineFilters, column: string): string[] {
+        const w = this.dateWindow(filters);
+        return w ? [`${column} ge ${w.from}`, `${column} le ${w.to}`] : [];
+    }
+
+    /** The date filter for activities, in FetchXML */
+    private dateConditions(filters: TimelineFilters, column: string): Cond[] {
+        const w = this.dateWindow(filters);
+        return w ? [condition(column, "ge", w.from), condition(column, "le", w.to)] : [];
+    }
+
+    private ownerCondition(filters: TimelineFilters): Cond | undefined {
+        return filters.onlyMine && this.currentUserId ? condition("ownerid", "eq", this.currentUserId) : undefined;
     }
 
     private notesWanted(filters?: TimelineFilters): boolean {
@@ -218,38 +488,27 @@ export class DataverseDataSource implements TimelineDataSource {
         return filters.types.length === 0 || filters.types.includes("annotation");
     }
 
-    private statusCondition(filters: TimelineFilters): string | undefined {
+    private statusCondition(filters: TimelineFilters): Cond | undefined {
         switch (filters.status) {
             case "open": return OPEN;
-            case "completed": return "statecode eq 1";
-            case "overdue": return allOf([OPEN, `scheduledend lt ${this.env.now().toISOString()}`, "activitytypecode ne 'email'"]);
+            case "completed": return condition("statecode", "eq", 1);
+            case "overdue": return allOf([OPEN, condition("scheduledend", "lt", this.env.now().toISOString()), condition("activitytypecode", "ne", EMAIL_CODE)]);
             default: return undefined;
         }
     }
 
     // --- counts -------------------------------------------------------------------------------------------
 
-    /** Record scope in FetchXML; "any" checks participants without multiplying rows, so counts stay exact */
-    private fetchScope(withParties: boolean): string {
-        const id = xmlValue(normalizeId(this.record.id));
-        const regarding = `<condition attribute="regardingobjectid" operator="eq" value="${id}" />`;
-        if (!withParties) return regarding;
-        return `<filter type="or">${regarding}<link-entity name="activityparty" from="activityid" to="activityid" link-type="any">` +
-            `<filter><condition attribute="partyid" operator="eq" value="${id}" /></filter></link-entity></filter>`;
-    }
-
-    /** Runs an aggregate over the record's activities; counts by regarding only if the participant filter is rejected. */
-    private async aggregate(fetchXml: (scope: string) => string): Promise<{ rows: Row[]; withParties: boolean }> {
-        const run = async (withParties: boolean) =>
-            (await this.context.webAPI.retrieveMultipleRecords("activitypointer", `?fetchXml=${encodeURIComponent(fetchXml(this.fetchScope(withParties)))}`)).entities as Row[];
-        if (this.config.includeParties) {
-            try {
-                return { rows: await run(true), withParties: true };
-            } catch {
-                // Fall through to regarding only
-            }
-        }
-        return { rows: await run(false), withParties: false };
+    /** Counts the activities in scope, grouped as asked. Rolled up, an activity related more than one way counts once. */
+    private async aggregate(groupBy: string, filter?: Cond): Promise<{ rows: Row[]; scope: Scope }> {
+        const result = await this.queryActivities((scope, rollup) => {
+            const where = allOf([scope, filter]);
+            const count = rollup
+                ? `<attribute name="activityid" alias="n" aggregate="countcolumn" distinct="true" />`
+                : `<attribute name="activityid" alias="n" aggregate="count" />`;
+            return `<fetch aggregate="true"><entity name="activitypointer">${count}${groupBy}${where ? `<filter type="and">${where}</filter>` : ""}</entity></fetch>`;
+        });
+        return { rows: result.rows, scope: result.scope };
     }
 
     private typeCodesPromise?: Promise<Map<number, string>>;
@@ -290,20 +549,56 @@ export class DataverseDataSource implements TimelineDataSource {
         return map;
     }
 
-    private async countTypeStates(): Promise<TypeStates> {
-        const allowed = this.activityTypes();
-        const notesXml = `<fetch aggregate="true"><entity name="annotation"><attribute name="annotationid" alias="n" aggregate="count" />` +
+    private snapshotPromise?: Promise<Snapshot | undefined>;
+
+    /** The record's activities from one query, or undefined when it has more than fit; `fresh` loads them again */
+    private snapshot(fresh: boolean): Promise<Snapshot | undefined> {
+        if (fresh || !this.snapshotPromise) {
+            if (fresh) this.forgetDetails();
+            // Without a snapshot, counts and feed query the way they do for large records
+            this.snapshotPromise = this.loadSnapshot().catch(() => undefined);
+        }
+        return this.snapshotPromise;
+    }
+
+    private async loadSnapshot(): Promise<Snapshot | undefined> {
+        const key = `${LARGE_RECORDS}:${this.record.entity}:${normalizeId(this.record.id)}`;
+        if (readSessionFlag(key)) return undefined;
+        const types = this.activityTypes();
+        const codes = await this.codesFor(types ?? []);
+        const result = await this.queryActivities((scope, rollup) => this.activityFetch({
+            filter: types ? typeIn(types, codes) : undefined,
+            orders: [["createdon", "desc"], ["activityid", "desc"]],
+            count: SNAPSHOT_LIMIT,
+            emails: !types || types.includes("email"),
+        }, scope, rollup));
+        if (result.more) {
+            writeSessionFlag(key);
+            return undefined;
+        }
+        return { rows: result.rows, scope: result.scope };
+    }
+
+    /** The record's own notes; notes don't roll up */
+    private countNotes(): Promise<number> {
+        if (!this.config.includeNotes) return Promise.resolve(0);
+        const xml = `<fetch aggregate="true"><entity name="annotation"><attribute name="annotationid" alias="n" aggregate="count" />` +
             `<filter><condition attribute="objectid" operator="eq" value="${xmlValue(normalizeId(this.record.id))}" /></filter></entity></fetch>`;
-        const [codes, activities, notes] = await Promise.all([
+        return this.context.webAPI.retrieveMultipleRecords("annotation", `?fetchXml=${encodeURIComponent(xml)}`).then((r) => num((r.entities as Row[])[0] ?? {}, "n") ?? 0);
+    }
+
+    private async countTypeStates(snapshot: Promise<Snapshot | undefined>): Promise<TypeStates> {
+        const notes = this.countNotes();
+        // Handled when awaited below; this keeps a failure from being reported as unhandled while the snapshot loads
+        notes.catch(() => undefined);
+        const all = await snapshot;
+        if (all) return { rows: countRows(all.rows), notes: await notes, scope: all.scope, complete: true };
+
+        const allowed = this.activityTypes();
+        const [codes, activities] = await Promise.all([
             this.typeCodes(),
             // Grouped by type and state; the types the timeline shows are picked out below
-            this.aggregate((scope) =>
-                `<fetch aggregate="true"><entity name="activitypointer"><attribute name="activityid" alias="n" aggregate="count" />` +
-                `<attribute name="activitytypecode" alias="type" groupby="true" /><attribute name="statecode" alias="state" groupby="true" />` +
-                `<filter type="and">${scope}</filter></entity></fetch>`),
-            this.config.includeNotes
-                ? this.context.webAPI.retrieveMultipleRecords("annotation", `?fetchXml=${encodeURIComponent(notesXml)}`).then((r) => num((r.entities as Row[])[0] ?? {}, "n") ?? 0)
-                : Promise.resolve(0),
+            this.aggregate(`<attribute name="activitytypecode" alias="type" groupby="true" /><attribute name="statecode" alias="state" groupby="true" />`),
         ]);
         const rows: TypeStates["rows"] = [];
         // Complete when every type the timeline shows has a name; other unnamed types don't matter then
@@ -319,29 +614,34 @@ export class DataverseDataSource implements TimelineDataSource {
             const state = mapState(num(r, "state"));
             rows.push({ entity, label: formatted(r, "type") ?? entity, open: state === "open" || state === "scheduled", count: num(r, "n") ?? 0 });
         }
-        return { rows, notes, withParties: activities.withParties, complete };
+        return { rows, notes: await notes, scope: activities.scope, complete };
     }
 
     private typeStatesPromise?: Promise<TypeStates | undefined>;
+    /** The counts once they're in. Undefined while counting, so the feed never waits for them. */
+    private counted?: TypeStates;
 
-    /** Counts per type and state; `fresh` counts again, otherwise the last result is reused */
+    /** Counts per type and state; `fresh` counts again (and loads the snapshot again), otherwise the last result is reused */
     private typeStates(fresh: boolean): Promise<TypeStates | undefined> {
         if (fresh || !this.typeStatesPromise) {
-            this.typeStatesPromise = this.countTypeStates().catch(() => undefined);
+            // Old counts could rule out a type that has just got its first item
+            this.counted = undefined;
+            const promise: Promise<TypeStates | undefined> = this.countTypeStates(this.snapshot(fresh))
+                .then((states) => {
+                    if (this.typeStatesPromise === promise) this.counted = states;
+                    return states;
+                })
+                .catch(() => undefined);
+            this.typeStatesPromise = promise;
         }
         return this.typeStatesPromise;
     }
 
     private async countOverdue(): Promise<number> {
         const allowed = this.activityTypes();
-        const now = xmlValue(this.env.now().toISOString());
         const [codes, result] = await Promise.all([
             this.typeCodes(),
-            this.aggregate((scope) =>
-                `<fetch aggregate="true"><entity name="activitypointer"><attribute name="activityid" alias="n" aggregate="count" />` +
-                `<attribute name="activitytypecode" alias="type" groupby="true" /><filter type="and">${scope}` +
-                `<condition attribute="statecode" operator="in"><value>0</value><value>3</value></condition>` +
-                `<condition attribute="scheduledend" operator="lt" value="${now}" /></filter></entity></fetch>`),
+            this.aggregate(`<attribute name="activitytypecode" alias="type" groupby="true" />`, allOf([OPEN, condition("scheduledend", "lt", this.env.now().toISOString())])),
         ]);
         return result.rows.reduce((sum, r) => {
             const entity = codes.get(num(r, "type") ?? -1);
@@ -352,7 +652,13 @@ export class DataverseDataSource implements TimelineDataSource {
     }
 
     public async getCounts(): Promise<Counts> {
-        const [states, overdue] = await Promise.all([this.typeStates(true), this.countOverdue().catch(() => 0)]);
+        const counting = this.typeStates(true);
+        // The snapshot the counts just asked for; without one, overdue items take an aggregate query of their own
+        const snapshot = await this.snapshot(false);
+        const [states, overdue] = await Promise.all([
+            counting,
+            snapshot ? Promise.resolve(countOverdueRows(snapshot.rows, this.env.now())) : this.countOverdue().catch(() => 0),
+        ]);
         if (!states) throw new Error("Couldn't count the timeline's items.");
 
         const byType = new Map<string, { entity: string; label: string; count: number }>();
@@ -369,10 +675,9 @@ export class DataverseDataSource implements TimelineDataSource {
         return { total: total + states.notes, byType: Array.from(byType.values()), open, overdue };
     }
 
-    /** False only when the counts show the record has nothing the slice could return */
-    private async sliceHasRows(slice: Slice): Promise<boolean> {
-        const states = await this.typeStates(false);
-        if (!states || !states.complete || (this.useParties && !states.withParties)) return true;
+    /** False only when counts show the record has nothing the slice could return */
+    private hasRows(states: TypeStates | undefined, slice: Pick<Slice, "states" | "types">): boolean {
+        if (!states || !states.complete || states.scope !== this.scope) return true;
         return states.rows.some(
             (r) => r.count > 0 && (!slice.types || slice.types.includes(r.entity)) && (slice.states === "any" || (slice.states === "open") === r.open),
         );
@@ -386,7 +691,7 @@ export class DataverseDataSource implements TimelineDataSource {
      */
     private feedSlices(types: string[] | undefined, sort: FeedSort, withUpcoming: boolean): { history: Slice[]; upcoming: Slice[] } {
         if (sort.activities !== "eventdate") {
-            return { history: [{ column: sort.activities, condition: types ? typeIn(types) : undefined, states: "any", types }], upcoming: [] };
+            return { history: [{ column: sort.activities, condition: types ? (c) => typeIn(types, c) : undefined, states: "any", types }], upcoming: [] };
         }
         const groups: Record<DateRule, string[]> = { created: [], start: [], due: [], completed: [] };
         const ruled = ruledTypes(this.config);
@@ -394,16 +699,17 @@ export class DataverseDataSource implements TimelineDataSource {
         else ruled.forEach((rule, entity) => groups[rule].push(entity));
         const { start, due, completed } = groups;
         const now = this.env.now().toISOString();
+        const isNull = (column: string) => condition(column, "null");
+        const notNull = (column: string) => condition(column, "not-null");
 
         // Placed by created on: types without a rule, plus ruled items that lack their date
-        const createdTypes = types
-            ? groups.created.length > 0 ? typeIn(groups.created) : undefined
-            : ruled.size > 0 ? allOf(Array.from(ruled.keys()).map((t) => `activitytypecode ne ${odataString(t)}`)) : undefined;
-        const created = anyOf([
-            createdTypes,
-            start.length > 0 ? allOf([typeIn(start), "scheduledstart eq null"]) : undefined,
-            due.length > 0 ? allOf([typeIn(due), anyOf([allOf([OPEN, "scheduledend eq null"]), allOf([CLOSED, "actualend eq null"])])]) : undefined,
-            completed.length > 0 ? allOf([typeIn(completed), anyOf([OPEN, "actualend eq null"])]) : undefined,
+        const created = (c: TypeCodes) => anyOf([
+            types
+                ? groups.created.length > 0 ? typeIn(groups.created, c) : undefined
+                : ruled.size > 0 ? typeNotIn(Array.from(ruled.keys()), c) : undefined,
+            start.length > 0 ? allOf([typeIn(start, c), isNull("scheduledstart")]) : undefined,
+            due.length > 0 ? allOf([typeIn(due, c), anyOf([allOf([OPEN, isNull("scheduledend")]), allOf([CLOSED, isNull("actualend")])])]) : undefined,
+            completed.length > 0 ? allOf([typeIn(completed, c), anyOf([OPEN, isNull("actualend")])]) : undefined,
         ]);
         const history: Slice[] = [];
         if (!types || groups.created.length + start.length + due.length + completed.length > 0) {
@@ -413,7 +719,7 @@ export class DataverseDataSource implements TimelineDataSource {
         if (start.length > 0) {
             history.push({
                 column: "scheduledstart",
-                condition: allOf([typeIn(start), "scheduledstart ne null", withUpcoming ? anyOf([CLOSED, `scheduledstart le ${now}`]) : undefined]),
+                condition: (c) => allOf([typeIn(start, c), notNull("scheduledstart"), withUpcoming ? anyOf([CLOSED, condition("scheduledstart", "le", now)]) : undefined]),
                 states: "any",
                 types: start,
             });
@@ -421,22 +727,22 @@ export class DataverseDataSource implements TimelineDataSource {
         if (due.length > 0) {
             history.push({
                 column: "scheduledend",
-                condition: allOf([typeIn(due), OPEN, "scheduledend ne null", withUpcoming ? `scheduledend le ${now}` : undefined]),
+                condition: (c) => allOf([typeIn(due, c), OPEN, notNull("scheduledend"), withUpcoming ? condition("scheduledend", "le", now) : undefined]),
                 states: "open",
                 types: due,
             });
         }
         const closable = [...due, ...completed];
         if (closable.length > 0) {
-            history.push({ column: "actualend", condition: allOf([typeIn(closable), CLOSED, "actualend ne null"]), states: "closed", types: closable });
+            history.push({ column: "actualend", condition: (c) => allOf([typeIn(closable, c), CLOSED, notNull("actualend")]), states: "closed", types: closable });
         }
 
         const upcoming: Slice[] = [];
         if (withUpcoming && start.length > 0) {
-            upcoming.push({ column: "scheduledstart", condition: allOf([typeIn(start), OPEN, `scheduledstart gt ${now}`]), states: "open", types: start });
+            upcoming.push({ column: "scheduledstart", condition: (c) => allOf([typeIn(start, c), OPEN, condition("scheduledstart", "gt", now)]), states: "open", types: start });
         }
         if (withUpcoming && due.length > 0) {
-            upcoming.push({ column: "scheduledend", condition: allOf([typeIn(due), OPEN, `scheduledend gt ${now}`]), states: "open", types: due });
+            upcoming.push({ column: "scheduledend", condition: (c) => allOf([typeIn(due, c), OPEN, condition("scheduledend", "gt", now)]), states: "open", types: due });
         }
         return { history, upcoming };
     }
@@ -456,9 +762,19 @@ export class DataverseDataSource implements TimelineDataSource {
         const types = this.activityTypes(filters);
         const withUpcoming = sort.activities === "eventdate" && sort.order === "desc";
         const slices = types && types.length === 0 ? { history: [], upcoming: [] } : this.feedSlices(types, sort, withUpcoming);
-        const stream = (slice: Slice, order: SortOrder): Stream => ({ fetch: (cursor) => this.fetchSlice(filters, slice, sort, order, cursor) });
+        // Every type a slice can name; system types need nothing, custom ones come from cached metadata
+        const codes = this.codesFor([...(types ?? []), ...ruledTypes(this.config).keys()]);
+        // With every activity at hand, a section's first slice serves them all from memory and the others stay empty
+        const memory = this.memoryFeed(filters, sort, withUpcoming);
+        const stream = (slice: Slice, order: SortOrder, section: keyof MemoryFeed, first: boolean): Stream => ({
+            fetch: async (cursor) => {
+                const held = await memory;
+                if (held) return first ? pageOf(held[section], cursor, this.config.pageSize) : { items: [] };
+                return this.fetchSlice(filters, slice, sort, order, codes, cursor);
+            },
+        });
 
-        const history = slices.history.filter((s) => this.sliceAllowed(s, filters)).map((s) => stream(s, sort.order));
+        const history = slices.history.filter((s) => this.sliceAllowed(s, filters)).map((s, i) => stream(s, sort.order, "history", i === 0));
         if (this.notesWanted(filters)) {
             // Notes are placed by created on when sorting by activity date
             const column = sort.activities === "eventdate" ? "createdon" : sort.notes;
@@ -466,23 +782,64 @@ export class DataverseDataSource implements TimelineDataSource {
         }
         const pagers: FeedPagers = { history: new HydratingPager(new MergedPager(history, sort.order), hydrate) };
 
-        const upcoming = filters.status === "overdue" ? [] : slices.upcoming.filter((s) => this.sliceAllowed(s, filters)).map((s) => stream(s, "asc"));
+        const upcoming = filters.status === "overdue"
+            ? []
+            : slices.upcoming.filter((s) => this.sliceAllowed(s, filters)).map((s, i) => stream(s, "asc", "upcoming", i === 0));
         if (upcoming.length > 0) pagers.upcoming = new HydratingPager(new MergedPager(upcoming, "asc"), hydrate);
         return pagers;
     }
 
-    private async fetchSlice(filters: TimelineFilters, slice: Slice, sort: FeedSort, order: SortOrder, cursor: string | undefined): Promise<StreamPage> {
-        if (!cursor && !(await this.sliceHasRows(slice))) return { items: [] };
-        const build = () => {
-            const conditions = [this.scopeFilter(), slice.condition, ...this.dateFilter(filters, slice.column), this.statusCondition(filters)];
-            if (filters.onlyMine && this.currentUserId) conditions.push(`_ownerid_value eq ${this.currentUserId}`);
+    /**
+     * The feed from the snapshot, filtered, placed and split the way the slice queries do it.
+     * Undefined without a snapshot, and then the slices query.
+     */
+    private async memoryFeed(filters: TimelineFilters, sort: FeedSort, withUpcoming: boolean): Promise<MemoryFeed | undefined> {
+        const snapshot = await this.snapshot(false);
+        if (!snapshot) return undefined;
+        const types = this.activityTypes(filters);
+        const now = this.env.now();
+        const feed: MemoryFeed = { history: [], upcoming: [] };
+        for (const r of snapshot.rows) {
+            const item = this.mapActivity(r, sort.activities);
+            if (types && !types.includes(item.entity)) continue;
+            if (!matchesStatus(item, filters.status)) continue;
+            if (filters.onlyMine && this.currentUserId && normalizeId(item.owner?.id ?? "") !== this.currentUserId) continue;
+            // The date filter applies to the date that places the item; sorted by one column, items without it drop out
+            if (filters.date.kind !== "any" && (!this.inDateFilter(filters, item.date) || (sort.activities !== "eventdate" && item.dateField !== sort.activities))) continue;
+            const rule = dateRule(item.entity, this.config);
+            const ahead = withUpcoming && isOpenState(item.state) &&
+                ((rule === "start" && !!item.scheduledStart && item.scheduledStart > now) || (rule === "due" && !!item.scheduledEnd && item.scheduledEnd > now));
+            (ahead ? feed.upcoming : feed.history).push(item);
+        }
+        feed.history.sort(compareByDate(sort.order));
+        feed.upcoming.sort(compareByDate("asc"));
+        return feed;
+    }
+
+    private async fetchSlice(
+        filters: TimelineFilters, slice: Slice, sort: FeedSort, order: SortOrder, codes: Promise<TypeCodes>, cursor: string | undefined,
+    ): Promise<StreamPage> {
+        // Uses counts only when they're already in: waiting for them would hold up the first page
+        if (!cursor && !this.hasRows(this.counted, slice)) return { items: [] };
+        const page = cursor ? (JSON.parse(cursor) as PageCursor) : { page: 1 };
+        const filter = allOf([
+            slice.condition?.(await codes),
+            ...this.dateConditions(filters, slice.column),
+            this.statusCondition(filters),
+            this.ownerCondition(filters),
+        ]);
+        const result = await this.queryActivities((scope, rollup) => this.activityFetch({
+            filter,
             // Like the built-in timeline: with a single sort column, activities without a value in it end up last
-            return `?$select=${LIGHT_SELECT}&$filter=${conditions.filter(Boolean).join(" and ")}&$orderby=${slice.column} ${order},activityid ${order}`;
+            orders: [[slice.column, order], ["activityid", order]],
+            count: this.config.pageSize,
+            page,
+            emails: !slice.types || slice.types.includes("email"),
+        }, scope, rollup));
+        return {
+            items: result.rows.map((r) => this.mapActivity(r, sort.activities)),
+            next: result.more ? JSON.stringify({ page: page.page + 1, cookie: result.cookie } as PageCursor) : undefined,
         };
-        const result = cursor
-            ? await this.context.webAPI.retrieveMultipleRecords("activitypointer", cursor, this.config.pageSize)
-            : await this.queryActivities(build, this.config.pageSize);
-        return { items: (result.entities as Row[]).map((r) => this.mapActivity(r, sort.activities)), next: nextOptions(result.nextLink) };
     }
 
     private notesQuery(filters: TimelineFilters, column: string, order: SortOrder, extra: string[] = []): string {
@@ -494,8 +851,7 @@ export class DataverseDataSource implements TimelineDataSource {
     private async fetchNotes(filters: TimelineFilters, column: string, order: SortOrder, cursor: string | undefined): Promise<StreamPage> {
         let options = cursor;
         if (!options) {
-            const states = await this.typeStates(false);
-            if (states && states.notes === 0) return { items: [] };
+            if (this.counted?.notes === 0) return { items: [] };
             options = this.notesQuery(filters, column, order);
         }
         const result = await this.context.webAPI.retrieveMultipleRecords("annotation", options, this.config.pageSize);
@@ -510,32 +866,40 @@ export class DataverseDataSource implements TimelineDataSource {
      * looked through (searchLimit), and notes from the same period.
      */
     private async search(filters: TimelineFilters, sort: FeedSort): Promise<SearchHits> {
-        const term = searchLiteral(filters.search);
         const limit = this.config.searchLimit;
         const types = this.activityTypes(filters);
         const event = sort.activities === "eventdate";
-        const scope = () => allOf([
-            this.scopeFilter(),
-            types ? typeIn(types) : undefined,
-            filters.date.kind === "any" ? undefined : anyOf((event ? EVENT_DATE_COLUMNS : [sort.activities]).map((c) => allOf(this.dateFilter(filters, c)))),
+        const [states, codes] = await Promise.all([this.typeStates(false), this.codesFor(types ?? [])]);
+        // Every condition but the search term, so the newest `limit` activities are the ones searched
+        const base = allOf([
+            types ? typeIn(types, codes) : undefined,
+            filters.date.kind !== "any" ? anyOf((event ? EVENT_DATE_COLUMNS : [sort.activities]).map((c) => allOf(this.dateConditions(filters, c)))) : undefined,
             this.statusCondition(filters),
-            filters.onlyMine && this.currentUserId ? `_ownerid_value eq ${this.currentUserId}` : undefined,
+            this.ownerCondition(filters),
         ]);
+        const newestFirst: [string, SortOrder][] = [["createdon", "desc"], ["activityid", "desc"]];
 
-        const hasActivities = (!types || types.length > 0) && (await this.sliceHasRows({ column: "createdon", states: "any", types }));
-        const from = hasActivities ? await this.searchStart(scope, limit) : undefined;
-        const since = from ? `createdon ge ${from.toISOString()}` : undefined;
+        const hasActivities = (!types || types.length > 0) && this.hasRows(states, { states: "any", types });
+        const from = hasActivities ? await this.searchStart(base, newestFirst, limit, states) : undefined;
 
         const searchActivities = async () => {
             if (!hasActivities) return [];
-            const build = () => `?$select=${LIGHT_SELECT}&$filter=${allOf([scope(), since, `(contains(subject,${term}) or contains(description,${term}))`])}&$orderby=createdon desc,activityid desc`;
-            return ((await this.queryActivities(build, limit)).entities as Row[]).map((r) => this.mapActivity(r, sort.activities));
+            const like = likePattern(filters.search);
+            const result = await this.queryActivities((scope, rollup) => this.activityFetch({
+                filter: allOf([base, from ? condition("createdon", "ge", from.toISOString()) : undefined, anyOf([condition("subject", "like", like), condition("description", "like", like)])]),
+                orders: newestFirst,
+                count: limit,
+                emails: !types || types.includes("email"),
+            }, scope, rollup));
+            return result.rows.map((r) => this.mapActivity(r, sort.activities));
         };
         const searchNotes = async () => {
-            if (!this.notesWanted(filters) || (await this.typeStates(false))?.notes === 0) return [];
+            if (!this.notesWanted(filters) || states?.notes === 0) return [];
             const column = event ? "createdon" : sort.notes;
+            const term = searchLiteral(filters.search);
             const contains = `(contains(subject,${term}) or contains(notetext,${term}) or contains(filename,${term}))`;
-            const result = await this.context.webAPI.retrieveMultipleRecords("annotation", this.notesQuery(filters, column, "desc", since ? [contains, since] : [contains]), limit);
+            const since = from ? [`createdon ge ${from.toISOString()}`] : [];
+            const result = await this.context.webAPI.retrieveMultipleRecords("annotation", this.notesQuery(filters, column, "desc", [contains, ...since]), limit);
             return (result.entities as Row[]).map((r) => this.mapNote(r, column));
         };
 
@@ -546,12 +910,12 @@ export class DataverseDataSource implements TimelineDataSource {
     }
 
     /** Created-on date of the oldest activity a search reaches; undefined when they all fit within the limit */
-    private async searchStart(scope: () => string | undefined, limit: number): Promise<Date | undefined> {
-        const states = await this.typeStates(false);
-        if (states?.complete && (!this.useParties || states.withParties) && states.rows.reduce((n, r) => n + r.count, 0) <= limit) return undefined;
-        const result = await this.queryActivities(() => `?$select=createdon&$filter=${scope()}&$orderby=createdon desc`, limit);
-        const last = result.entities[result.entities.length - 1] as Row | undefined;
-        return result.nextLink && last ? date(last, "createdon") : undefined;
+    private async searchStart(base: Cond | undefined, orders: [string, SortOrder][], limit: number, states: TypeStates | undefined): Promise<Date | undefined> {
+        if (states?.complete && states.scope === this.scope && states.rows.reduce((n, r) => n + r.count, 0) <= limit) return undefined;
+        const result = await this.queryActivities((scope, rollup) =>
+            this.activityFetch({ filter: base, orders, count: limit, columns: ["activityid", "createdon"] }, scope, rollup));
+        const last = result.rows[result.rows.length - 1];
+        return result.more && last ? date(last, "createdon") : undefined;
     }
 
     private inDateFilter(filters: TimelineFilters, value: Date): boolean {
@@ -563,13 +927,34 @@ export class DataverseDataSource implements TimelineDataSource {
         return true;
     }
 
-    /** Bodies, participants and attachment counts for activities about to be shown: one query per 25 items */
+    /** Details rows already loaded, by activity id, so a filter or sort shows them again without a query */
+    private readonly detailRows = new Map<string, Row>();
+    /** Attachment counts already counted, by activity id */
+    private readonly attachmentCounts = new Map<string, number>();
+
+    /** Forgets loaded details: all of them when the activities load again, or one item's after it's changed */
+    private forgetDetails(id?: string): void {
+        if (id === undefined) {
+            this.detailRows.clear();
+            this.attachmentCounts.clear();
+        } else {
+            this.detailRows.delete(id.toLowerCase());
+            this.attachmentCounts.delete(id.toLowerCase());
+        }
+    }
+
+    /** Bodies, participants and attachment counts for activities about to be shown: one query per 25 items not loaded yet */
     private async hydrate(items: TimelineItem[]): Promise<void> {
         const activities = items.filter((i) => i.kind === "activity");
         if (activities.length === 0) return;
-        const byId = new Map(activities.map((i) => [i.id.toLowerCase(), i]));
+        const missing = activities.filter((i) => {
+            const row = this.detailRows.get(i.id.toLowerCase());
+            if (row) this.applyDetails(i, row);
+            return !row;
+        });
+        const byId = new Map(missing.map((i) => [i.id.toLowerCase(), i]));
         const chunks: TimelineItem[][] = [];
-        for (let i = 0; i < activities.length; i += DETAILS_CHUNK) chunks.push(activities.slice(i, i + DETAILS_CHUNK));
+        for (let i = 0; i < missing.length; i += DETAILS_CHUNK) chunks.push(missing.slice(i, i + DETAILS_CHUNK));
         await Promise.all([
             ...chunks.map(async (chunk) => {
                 const filter = chunk.map((i) => `activityid eq ${i.id}`).join(" or ");
@@ -579,7 +964,9 @@ export class DataverseDataSource implements TimelineDataSource {
                     chunk.length,
                 );
                 for (const r of result.entities as Row[]) {
-                    const item = byId.get((str(r, "activityid") ?? "").toLowerCase());
+                    const id = (str(r, "activityid") ?? "").toLowerCase();
+                    this.detailRows.set(id, r);
+                    const item = byId.get(id);
                     if (item) this.applyDetails(item, r);
                 }
             }),
@@ -599,25 +986,29 @@ export class DataverseDataSource implements TimelineDataSource {
         for (const item of open) item.statusDetail = options.get(item.entity)?.find((s) => s.value === item.statusCode)?.detail;
     }
 
-    /** Emails don't expose an attachment count on activitypointer, so count them in one query per page */
+    /** Appointments have no attachment count to read, so count theirs in one query per page; emails bring their own */
     private async addAttachmentCounts(items: TimelineItem[]): Promise<void> {
-        const ids = items.filter((i) => i.entity === "email" || i.entity === "appointment").map((i) => i.id);
-        if (ids.length === 0) return;
+        const counted = (i: TimelineItem) => this.attachmentCounts.get(i.id.toLowerCase());
+        const ids = items
+            .filter((i) => (i.entity === "appointment" || (i.entity === "email" && i.attachmentCount === undefined)) && counted(i) === undefined)
+            .map((i) => i.id);
         try {
-            const filter = ids.map((id) => `_objectid_value eq ${id}`).join(" or ");
-            const result = await this.context.webAPI.retrieveMultipleRecords("activitymimeattachment", `?$select=_objectid_value&$filter=${filter}`, 5000);
-            const counts = new Map<string, number>();
-            for (const r of result.entities as Row[]) {
-                const id = str(r, "_objectid_value")?.toLowerCase();
-                if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
+            if (ids.length > 0) {
+                const filter = ids.map((id) => `_objectid_value eq ${id}`).join(" or ");
+                const result = await this.context.webAPI.retrieveMultipleRecords("activitymimeattachment", `?$select=_objectid_value&$filter=${filter}`, 5000);
+                ids.forEach((id) => this.attachmentCounts.set(id.toLowerCase(), 0));
+                for (const r of result.entities as Row[]) {
+                    const id = str(r, "_objectid_value")?.toLowerCase();
+                    if (id) this.attachmentCounts.set(id, (this.attachmentCounts.get(id) ?? 0) + 1);
+                }
             }
-            items.forEach((i) => {
-                const c = counts.get(i.id.toLowerCase());
-                if (c) i.attachmentCount = c;
-            });
         } catch {
             // Counts are a nicety; the feed works without them
         }
+        items.forEach((i) => {
+            const c = counted(i);
+            if (c) i.attachmentCount = c;
+        });
     }
 
     // --- mapping ------------------------------------------------------------------------------------------
@@ -657,6 +1048,7 @@ export class DataverseDataSource implements TimelineDataSource {
             createdBy: lookup(r, "createdby"),
             from: [], to: [], cc: [], attendees: [],
             threadKey: entity === "email" ? threadKeyFor(subject) : undefined,
+            attachmentCount: entity === "email" ? num(r, EMAIL_ATTACHMENTS) : undefined,
         };
 
         if (sort === "eventdate") {
@@ -921,6 +1313,9 @@ export class DataverseDataSource implements TimelineDataSource {
         }
         await this.context.webAPI.updateRecord(item.entity, item.id, data);
         applyChanges(item, before, changes, this.labels.note, this.env.now());
+        // The snapshot and the loaded details still hold the item as it was; the next feed loads them again
+        this.snapshotPromise = undefined;
+        this.forgetDetails(item.id);
     }
 
     public async openRecord(entity: string, id: string): Promise<void> {
@@ -968,6 +1363,57 @@ function statusOptions(md: MetadataLike | undefined): StatusOption[] {
 
 function isOverdue(entity: string, state: ItemState, scheduledEnd: Date | undefined, now: Date): boolean {
     return entity !== "email" && (state === "open" || state === "scheduled") && !!scheduledEnd && scheduledEnd.getTime() < now.getTime();
+}
+
+/** Counts per type and state from snapshot rows, as the aggregate query gives them */
+function countRows(rows: Row[]): TypeStates["rows"] {
+    const counts = new Map<string, TypeStates["rows"][number]>();
+    for (const r of rows) {
+        const entity = str(r, "activitytypecode") ?? "activitypointer";
+        const open = isOpenState(mapState(num(r, "statecode")));
+        const key = `${entity}:${open}`;
+        const entry = counts.get(key) ?? { entity, label: formatted(r, "activitytypecode") ?? entity, open, count: 0 };
+        entry.count++;
+        counts.set(key, entry);
+    }
+    return Array.from(counts.values());
+}
+
+function countOverdueRows(rows: Row[], now: Date): number {
+    return rows.filter((r) => isOverdue(str(r, "activitytypecode") ?? "", mapState(num(r, "statecode")), date(r, "scheduledend"), now)).length;
+}
+
+/** The status filter, as statusCondition puts it in FetchXML */
+function matchesStatus(item: TimelineItem, status: TimelineFilters["status"]): boolean {
+    switch (status) {
+        case "open": return isOpenState(item.state);
+        case "completed": return item.state === "completed";
+        case "overdue": return item.isOverdue;
+        default: return true;
+    }
+}
+
+/** One page of items held in memory; the cursor is where the page starts */
+function pageOf(items: TimelineItem[], cursor: string | undefined, size: number): StreamPage {
+    const from = cursor ? Number(cursor) : 0;
+    const to = from + size;
+    return { items: items.slice(from, to), next: to < items.length ? String(to) : undefined };
+}
+
+function readSessionFlag(key: string): boolean {
+    try {
+        return window.sessionStorage.getItem(key) !== null;
+    } catch {
+        return false;
+    }
+}
+
+function writeSessionFlag(key: string): void {
+    try {
+        window.sessionStorage.setItem(key, "1");
+    } catch {
+        // Without storage, a large record just tries the single query again next time
+    }
 }
 
 /** Turns an absolute @odata.nextLink into the options string retrieveMultipleRecords expects */

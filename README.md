@@ -22,7 +22,11 @@ conversations, and preview any activity without leaving the form.
   summary that filters the feed when clicked.
 - **Filters on demand:** search in titles and content, activity types with counts, status, date and "Only mine".
   They stay hidden until the user opens them.
-- **Fast on busy records:** loads 20 items at a time and the next 20 as the user scrolls.
+- **Reaches as deep as the built-in timeline:** on accounts, contacts, opportunities and leads it can also show the
+  activities of records below, through the same Dataverse rollup the built-in timeline uses.
+- **Fast:** most records get every activity in one query, so the timeline shows after three small queries and
+  filters work without asking Dataverse again. Busy records load 20 items at a time, and the next 20 as the user
+  scrolls.
 - **English, Norwegian, Swedish and Danish**, following each user's language in Dataverse.
 
 Everything shown is data from Dataverse; nothing is generated or summarised.
@@ -74,7 +78,10 @@ Which activities appear:
 - **Regarding:** activities whose *Regarding* is the record, on any table with activities enabled.
 - **Participant:** with *Related activities* set to *Regarding or participant* (the default), also activities
   where the record is a sender, recipient or attendee. This is useful on contacts and accounts.
-- **Notes:** notes and their files, on tables with notes enabled.
+- **Rolled up:** with *Activity rollup type* set to *Related* or *Extended* on an account, contact, opportunity or
+  lead, also the activities of records below it, such as an account's contacts and opportunities. See
+  [Activity rollup type](#activity-rollup-type).
+- **Notes:** the record's own notes and their files, on tables with notes enabled.
 
 ## Settings
 
@@ -82,7 +89,8 @@ Which activities appear:
 |---|---|---|
 | Activity types | `email,phonecall,task,appointment` | Activity tables to show, by logical name, comma-separated. `*` shows every activity type. Custom activities work too, e.g. `new_message` |
 | Show notes | Yes | Shows notes and their files, and lets users write notes from the **New** menu |
-| Related activities | Regarding or participant | *Regarding the record*, or also activities where the record is a sender, recipient or attendee |
+| Related activities | Regarding or participant | *Regarding the record*, or also activities where the record is a sender, recipient or attendee. Not used while a rollup applies |
+| Activity rollup type | None | How far down the timeline reaches: *None* (this record only), *Related* (also records directly below) or *Extended* (every level below). Account, contact, opportunity and lead only; see [Activity rollup type](#activity-rollup-type) |
 | Sort by | Activity date | The date each activity is placed by. *Activity date* uses the date that matters per type (see [Where items appear](#where-items-appear)). The other choices use one column for every type, like the built-in timeline: Created on, Last updated, Actual end, Due date, Start date, Date sent or Sort date |
 | Sort notes by | Last updated | Used when sorting by a single column: Created on or Last updated. With *Activity date*, notes use Created on |
 | Default sort order | Newest first | Users can switch |
@@ -127,8 +135,30 @@ All keys are optional:
 | `loadRemoteImages` | Show remote images in emails without asking. Off by default, because remote images can track when an email is read |
 | `searchLimit` | How many of the newest activities a search looks through, 10–5000. Default 500. Notes from the same period are included. When a record has more, the results say how far back the search reached |
 
-If the JSON has a problem, the timeline shows a warning at the top explaining what to fix. Every user sees it, so
-check the form before you publish.
+If the JSON has a problem, or *Activity rollup type* is set on a table Dataverse can't roll up, the timeline shows
+a warning at the top explaining what to fix. Every user sees it, so check the form before you publish.
+
+### Activity rollup type
+
+The same choice as *Activity rollup type* in the built-in timeline, answered by the same Dataverse function
+(`RetrieveTimelineWallRecords`), so with the same value both show the same activities.
+
+| Value | Shows |
+|---|---|
+| None (default) | The record's own activities, as set under *Related activities* |
+| Related | Also the activities of records directly related to this one |
+| Extended | Also the activities of records related to those, and so on down |
+
+- **Only on account, contact, opportunity and lead.** Dataverse can't roll up other tables, including custom ones.
+  There the timeline shows the record's own activities and a warning for the maker.
+- **Which related tables count is set on each relationship**, not in the control. A one-to-many relationship rolls
+  up when its *Rollup view* behaviour is *Cascade all* (or *Cascade active* / *Cascade user-owned*). Dataverse
+  always includes an account's contacts. To include a table: **Tables** → for example *Contact* →
+  **Relationships** → open the one-to-many relationship → behaviour **Custom** → **Rollup view: Cascade all** →
+  **Save**, then publish. This changes the built-in timeline too.
+- To match the built-in timeline on a form, use the value it has there.
+- **Notes aren't rolled up**: the timeline shows the record's own notes. The built-in timeline has a separate
+  setting for notes, so where that's on it can show more notes.
 
 ## Where items appear
 
@@ -210,26 +240,34 @@ request (see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)).
 - **Email bodies:** shown in a sandboxed frame that can't run scripts. Remote images are blocked until the user
   chooses to show them.
 - **Stored in the browser:** the user's view preferences per table (sort, density, filters) and the time they
-  last opened each record. Both are kept in the browser's local storage.
+  last opened each record, in the browser's local storage. For the browser session, which records have more than
+  100 activities, in session storage.
 
 ## Performance
 
-A first load sends about ten small requests:
-- counts per activity type and status;
-- one short query per kind of date;
-- one query for the shown items' details.
+For a record with up to 100 activities, which is most records, the timeline shows after three small queries:
 
-Kinds of activities the record doesn't have aren't queried.
+- one for every activity, as light rows (type, subject, status, dates, owner);
+- notes, with their count;
+- then the text and participants of the items shown.
+
+Counts, the *Upcoming* section, filters and sorting are worked out from what's loaded, so changing a filter
+doesn't query activities again. Details already loaded are kept while the form is open.
+
+A record with more than 100 activities is paged instead: one short query per kind of date and two for the counts,
+side by side, 20 items at a time. The first time such a record opens in a browser session, it waits for one extra
+query, which finds out that it's large.
+
+For comparison, the built-in timeline sends about 17 requests to open an account.
 
 ## Known limitations
 
 - Posts (Dynamics 365 only) aren't shown.
-- Activities of an account's child contacts and opportunities aren't rolled up onto the account; participant
-  matching covers the common contact and account cases.
+- Rollup works only where Dataverse supports it: account, contact, opportunity and lead. Notes aren't rolled up.
 - No reply or forward buttons yet; open the email to reply.
 - Items can't be pinned to the top.
-- So far it has been used mostly on case forms. If something looks wrong on another table, please
-  [open an issue](../../issues).
+- So far it has been used on case, account, contact and opportunity forms. If something looks wrong on another
+  table, please [open an issue](../../issues).
 
 ## Build from source
 

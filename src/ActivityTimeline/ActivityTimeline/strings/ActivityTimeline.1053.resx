@@ -64,13 +64,28 @@
     <value>Relaterade aktiviteter</value>
   </data>
   <data name="RelatedScope_Description" xml:space="preserve">
-    <value>Bara aktiviteter angående posten, eller även aktiviteter där posten är avsändare, mottagare eller deltagare.</value>
+    <value>Bara aktiviteter angående posten, eller även aktiviteter där posten är avsändare, mottagare eller deltagare. Med en annan upprullningstyp än Ingen avgör Dataverse detta.</value>
   </data>
   <data name="RelatedScope_Regarding" xml:space="preserve">
     <value>Angående posten</value>
   </data>
   <data name="RelatedScope_Parties" xml:space="preserve">
     <value>Angående eller deltagare</value>
+  </data>
+  <data name="RollupType_Name" xml:space="preserve">
+    <value>Upprullningstyp för aktiviteter</value>
+  </data>
+  <data name="RollupType_Description" xml:space="preserve">
+    <value>Hur långt ned tidslinjen når, som upprullningstypen i den inbyggda tidslinjen. Fungerar på konto, kontakt, affärsmöjlighet och potentiell kund; vilka relaterade tabeller som tas med anges på varje relation (Rollup View). Annars visar tidslinjen postens egna aktiviteter.</value>
+  </data>
+  <data name="RollupType_None" xml:space="preserve">
+    <value>Ingen – bara den här posten</value>
+  </data>
+  <data name="RollupType_Related" xml:space="preserve">
+    <value>Relaterad – även poster direkt under</value>
+  </data>
+  <data name="RollupType_Extended" xml:space="preserve">
+    <value>Utökad – alla nivåer under</value>
   </data>
   <data name="SortBy_Name" xml:space="preserve">
     <value>Sortera efter</value>

@@ -68,11 +68,23 @@ export class ActivityTimeline implements ComponentFramework.ReactControl<IInputs
     }
 
     public updateView(context: ComponentFramework.Context<IInputs>): React.ReactElement {
+        const info = (context.mode as unknown as { contextInfo?: ContextInfo }).contextInfo;
+        let record: RecordContext | undefined =
+            info?.entityId && info.entityTypeName ? { entity: info.entityTypeName, id: info.entityId, name: info.entityRecordName ?? "" } : undefined;
+        // The platform calls updateView several times while the form loads, and the record name can arrive late.
+        // The same record must stay the same object, or the timeline would load everything again each time.
+        if (record && this.record && record.entity === this.record.entity && record.id === this.record.id) {
+            this.record.name = record.name;
+            record = this.record;
+        }
+        this.record = record;
+
         const p = context.parameters;
         const raw: RawConfig = {
             activityTypes: p.activityTypes?.raw,
             includeNotes: p.includeNotes?.raw,
             relatedScope: p.relatedScope?.raw,
+            rollupType: p.rollupType?.raw,
             sortBy: p.sortBy?.raw,
             notesSortBy: p.notesSortBy?.raw,
             sortOrder: p.sortOrder?.raw,
@@ -84,23 +96,13 @@ export class ActivityTimeline implements ComponentFramework.ReactControl<IInputs
             threadEmails: p.threadEmails?.raw,
             advancedConfig: p.advancedConfig?.raw,
         };
-        const configKey = JSON.stringify(raw);
+        // The table is part of the key: whether rollup applies depends on it
+        const configKey = `${JSON.stringify(raw)}|${record?.entity ?? ""}`;
         if (!this.config || configKey !== this.configKey) {
-            this.config = parseConfig(raw);
+            this.config = parseConfig(raw, record?.entity);
             this.configKey = configKey;
         }
         const config = this.config;
-
-        const info = (context.mode as unknown as { contextInfo?: ContextInfo }).contextInfo;
-        let record: RecordContext | undefined =
-            info?.entityId && info.entityTypeName ? { entity: info.entityTypeName, id: info.entityId, name: info.entityRecordName ?? "" } : undefined;
-        // The platform calls updateView several times while the form loads, and the record name can arrive late.
-        // The same record must stay the same object, or the timeline would load everything again each time.
-        if (record && this.record && record.entity === this.record.entity && record.id === this.record.id) {
-            this.record.name = record.name;
-            record = this.record;
-        }
-        this.record = record;
 
         // The test harness has no record or Dataverse; development builds show sample data there
         const sample = record ? undefined : createSampleSource(config);

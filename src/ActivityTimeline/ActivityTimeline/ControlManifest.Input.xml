@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <manifest>
-  <control namespace="Sandsor" constructor="ActivityTimeline" version="0.2.8" display-name-key="Control_Name" description-key="Control_Description" control-type="virtual" >
+  <control namespace="Sandsor" constructor="ActivityTimeline" version="0.3.2" display-name-key="Control_Name" description-key="Control_Description" control-type="virtual" >
     <external-service-usage enabled="false">
     </external-service-usage>
 
@@ -28,6 +28,11 @@
     <property name="relatedScope" display-name-key="RelatedScope_Name" description-key="RelatedScope_Description" of-type="Enum" usage="input" required="false" default-value="parties">
       <value name="regarding" display-name-key="RelatedScope_Regarding">regarding</value>
       <value name="parties" display-name-key="RelatedScope_Parties">parties</value>
+    </property>
+    <property name="rollupType" display-name-key="RollupType_Name" description-key="RollupType_Description" of-type="Enum" usage="input" required="false" default-value="none">
+      <value name="none" display-name-key="RollupType_None">none</value>
+      <value name="related" display-name-key="RollupType_Related">related</value>
+      <value name="extended" display-name-key="RollupType_Extended">extended</value>
     </property>
     <property name="sortBy" display-name-key="SortBy_Name" description-key="SortBy_Description" of-type="Enum" usage="input" required="false" default-value="eventdate">
       <value name="eventdate" display-name-key="SortBy_EventDate">eventdate</value>

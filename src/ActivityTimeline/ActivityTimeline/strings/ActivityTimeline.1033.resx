@@ -64,13 +64,28 @@
     <value>Related activities</value>
   </data>
   <data name="RelatedScope_Description" xml:space="preserve">
-    <value>Activities regarding the record only, or also activities where the record is a sender, recipient or attendee.</value>
+    <value>Activities regarding the record only, or also activities where the record is a sender, recipient or attendee. With an activity rollup type other than None, Dataverse decides this.</value>
   </data>
   <data name="RelatedScope_Regarding" xml:space="preserve">
     <value>Regarding the record</value>
   </data>
   <data name="RelatedScope_Parties" xml:space="preserve">
     <value>Regarding or participant</value>
+  </data>
+  <data name="RollupType_Name" xml:space="preserve">
+    <value>Activity rollup type</value>
+  </data>
+  <data name="RollupType_Description" xml:space="preserve">
+    <value>How far down the timeline reaches, like the built-in timeline's activity rollup type. Works on account, contact, opportunity and lead; which related tables count is set on each relationship (Rollup View). Elsewhere the timeline shows the record's own activities.</value>
+  </data>
+  <data name="RollupType_None" xml:space="preserve">
+    <value>None – this record only</value>
+  </data>
+  <data name="RollupType_Related" xml:space="preserve">
+    <value>Related – also records directly below</value>
+  </data>
+  <data name="RollupType_Extended" xml:space="preserve">
+    <value>Extended – every level below</value>
   </data>
   <data name="SortBy_Name" xml:space="preserve">
     <value>Sort by</value>
