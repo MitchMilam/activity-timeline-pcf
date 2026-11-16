@@ -145,7 +145,7 @@
     <value>Objekt per sida</value>
   </data>
   <data name="PageSize_Description" xml:space="preserve">
-    <value>Hur många objekt som läses in åt gången (5–100, standard 20). Äldre objekt läses in när användaren rullar.</value>
+    <value>Hur många objekt som läses in åt gången (5–100, standard 25). Äldre objekt läses in när användaren rullar.</value>
   </data>
   <data name="Height_Name" xml:space="preserve">
     <value>Höjd (px)</value>

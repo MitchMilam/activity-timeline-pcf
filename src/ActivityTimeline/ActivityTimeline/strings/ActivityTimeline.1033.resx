@@ -145,7 +145,7 @@
     <value>Items per page</value>
   </data>
   <data name="PageSize_Description" xml:space="preserve">
-    <value>How many items load at a time (5–100, default 20). Older items load as the user scrolls.</value>
+    <value>How many items load at a time (5–100, default 25). Older items load as the user scrolls.</value>
   </data>
   <data name="Height_Name" xml:space="preserve">
     <value>Height (px)</value>

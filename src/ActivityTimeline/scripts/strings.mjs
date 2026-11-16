@@ -96,10 +96,10 @@ const S = {
     ],
     PageSize_Name: ["Items per page", "Elementer per side", "Objekt per sida", "Elementer pr. side"],
     PageSize_Description: [
-        "How many items load at a time (5–100, default 20). Older items load as the user scrolls.",
-        "Hvor mange elementer som lastes om gangen (5–100, standard 20). Eldre elementer lastes når brukeren ruller.",
-        "Hur många objekt som läses in åt gången (5–100, standard 20). Äldre objekt läses in när användaren rullar.",
-        "Hvor mange elementer der indlæses ad gangen (5–100, standard 20). Ældre elementer indlæses, når brugeren ruller.",
+        "How many items load at a time (5–100, default 25). Older items load as the user scrolls.",
+        "Hvor mange elementer som lastes om gangen (5–100, standard 25). Eldre elementer lastes når brukeren ruller.",
+        "Hur många objekt som läses in åt gången (5–100, standard 25). Äldre objekt läses in när användaren rullar.",
+        "Hvor mange elementer der indlæses ad gangen (5–100, standard 25). Ældre elementer indlæses, når brugeren ruller.",
     ],
     Height_Name: ["Height (px)", "Høyde (px)", "Höjd (px)", "Højde (px)"],
     Height_Description: [

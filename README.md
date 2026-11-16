@@ -24,9 +24,9 @@ conversations, and preview any activity without leaving the form.
   They stay hidden until the user opens them.
 - **Reaches as deep as the built-in timeline:** on accounts, contacts, opportunities and leads it can also show the
   activities of records below, through the same Dataverse rollup the built-in timeline uses.
-- **Fast:** most records get every activity in one query, so the timeline shows after three small queries and
-  filters work without asking Dataverse again. Busy records load 20 items at a time, and the next 20 as the user
-  scrolls.
+- **Fast:** loads 25 items at a time. A record with up to 25 activities gets them all in one query, so the
+  timeline shows after three small queries and filters work without asking Dataverse again. Busier records load
+  the next 25 as the user scrolls.
 - **English, Norwegian, Swedish and Danish**, following each user's language in Dataverse.
 
 Everything shown is data from Dataverse; nothing is generated or summarised.
@@ -95,7 +95,7 @@ Which activities appear:
 | Sort notes by | Last updated | Used when sorting by a single column: Created on or Last updated. With *Activity date*, notes use Created on |
 | Default sort order | Newest first | Users can switch |
 | Types users can create | `email,phonecall,task,appointment` | Activity types in the **New** menu. They open the quick create form (the full form for email) with the record filled in. Leave empty to hide the menu |
-| Items per page | 20 | 5–100. Older items load as the user scrolls |
+| Items per page | 25 | 5–100. Older items load as the user scrolls. Also the most activities one query in the feed fetches |
 | Height (px) | 0 | 0: the timeline grows with its content and the page scrolls, like the built-in timeline. A number gives a fixed height with its own scroll |
 | Default density | Comfortable | *Comfortable* shows a preview of each item's content; *Compact* shows one line per item. Users can switch |
 | Show overview | Yes | Shows the summary line of overdue and open items |
@@ -240,12 +240,13 @@ request (see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)).
 - **Email bodies:** shown in a sandboxed frame that can't run scripts. Remote images are blocked until the user
   chooses to show them.
 - **Stored in the browser:** the user's view preferences per table (sort, density, filters) and the time they
-  last opened each record, in the browser's local storage. For the browser session, which records have more than
-  100 activities, in session storage.
+  last opened each record, in the browser's local storage. For the browser session, which records have more
+  activities than fit on one page, in session storage.
 
 ## Performance
 
-For a record with up to 100 activities, which is most records, the timeline shows after three small queries:
+The timeline loads 25 items at a time (*Items per page*), and no query in the feed fetches more than that. For a
+record with up to 25 activities, the timeline shows after three small queries:
 
 - one for every activity, as light rows (type, subject, status, dates, owner);
 - notes, with their count;
@@ -254,9 +255,10 @@ For a record with up to 100 activities, which is most records, the timeline show
 Counts, the *Upcoming* section, filters and sorting are worked out from what's loaded, so changing a filter
 doesn't query activities again. Details already loaded are kept while the form is open.
 
-A record with more than 100 activities is paged instead: one short query per kind of date and two for the counts,
-side by side, 20 items at a time. The first time such a record opens in a browser session, it waits for one extra
-query, which finds out that it's large.
+A record with more than 25 activities is paged instead: one query of 25 per kind of date and two for the counts,
+side by side, and the next 25 as the user scrolls. The first time such a record opens in a browser session, it
+waits for one extra query, which finds out that it's large. On a test case with 15 items, loading it in one query
+took 5 requests and loading it paged took 12.
 
 For comparison, the built-in timeline sends about 17 requests to open an account.
 

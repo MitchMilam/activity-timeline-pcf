@@ -34,12 +34,7 @@ const PARTY_EXPAND = "activitypointer_activity_parties($select=participationtype
 const NOTE_SELECT = "annotationid,subject,notetext,filename,filesize,mimetype,isdocument,createdon,modifiedon,_createdby_value,_ownerid_value";
 /** When sorting by activity date, an activity can sit at any of these */
 const EVENT_DATE_COLUMNS: SortColumn[] = ["createdon", "scheduledstart", "scheduledend", "actualend"];
-/**
- * A record with up to this many activities gets them all in one query, and its counts, feed and filters work from that.
- * A larger record pages through one query per date column instead.
- */
-const SNAPSHOT_LIMIT = 100;
-/** Records found to have more, kept for the browser session so they go straight to paging */
+/** Records with more activities than fit on a page, kept for the browser session so they go straight to paging */
 const LARGE_RECORDS = "rsn-activitytimeline:large";
 
 // --- value helpers ----------------------------------------------------------------------------------------
@@ -174,7 +169,7 @@ interface FetchPage {
  */
 type Scope = "rollup" | "parties" | "regarding";
 
-/** Every activity in scope as light rows, newest first; only for records with no more than SNAPSHOT_LIMIT */
+/** Every activity in scope as light rows, newest first; only for records with no more than a page of them */
 interface Snapshot {
     rows: Row[];
     scope: Scope;
@@ -561,6 +556,10 @@ export class DataverseDataSource implements TimelineDataSource {
         return this.snapshotPromise;
     }
 
+    /**
+     * A record with no more activities than fit on a page gets them all in this one query, and its counts, feed and
+     * filters work from that. A larger record pages through one query per date column instead.
+     */
     private async loadSnapshot(): Promise<Snapshot | undefined> {
         const key = `${LARGE_RECORDS}:${this.record.entity}:${normalizeId(this.record.id)}`;
         if (readSessionFlag(key)) return undefined;
@@ -569,7 +568,7 @@ export class DataverseDataSource implements TimelineDataSource {
         const result = await this.queryActivities((scope, rollup) => this.activityFetch({
             filter: types ? typeIn(types, codes) : undefined,
             orders: [["createdon", "desc"], ["activityid", "desc"]],
-            count: SNAPSHOT_LIMIT,
+            count: this.config.pageSize,
             emails: !types || types.includes("email"),
         }, scope, rollup));
         if (result.more) {

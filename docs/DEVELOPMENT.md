@@ -88,14 +88,15 @@ built in, custom ones come from metadata.
 
 Queries per load:
 
-1. **Activities**: one light `activitypointer` query, newest first, `count` 100, with each email's
-   `attachmentcount` joined in. When it holds every activity (most records), counts, overdue, the *Upcoming*
+1. **Activities**: one light `activitypointer` query, newest first, `count` = *Items per page* (25 by default), with
+   each email's `attachmentcount` joined in. When it holds every activity, counts, overdue, the *Upcoming*
    section, filters and paging are worked out from it in memory, and step 2 doesn't run. **Notes**: one aggregate
    for the count and one paged `annotation` query.
-2. **Large records** (more than 100): two FetchXML aggregates (activities per type and state, overdue per type)
-   and per kind of date (created, start, due, completed) a paged light query, side by side. `MergedPager` merges
-   them in date order; filters and search run in Dataverse, so paging stays correct. The counts tell later loads
-   which queries they can skip. The record is kept in `sessionStorage`, so its next load starts here.
+2. **Large records** (more than a page): two FetchXML aggregates (activities per type and state, overdue per type)
+   and per kind of date (created, start, due, completed, and the two *Upcoming* ones) a light query of one page,
+   side by side. `MergedPager` merges them in date order; filters and search run in Dataverse, so paging stays
+   correct. The counts tell later loads which queries they can skip. The record is kept in `sessionStorage`, so its
+   next load starts here.
 3. **Details** for the shown items: `activitypointer` by id with `activitypointer_activity_parties` expanded
    (25 per query), `activitymimeattachment` ids for appointments' attachment counts, and status labels from
    metadata. Kept while the form is open; **Refresh** and saving the item drop them.

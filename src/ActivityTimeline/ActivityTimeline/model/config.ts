@@ -182,7 +182,7 @@ export function parseConfig(raw: RawConfig, entity?: string): TimelineConfig {
         notesSortBy: raw.notesSortBy === "createdon" ? "createdon" : "modifiedon",
         sortOrder: raw.sortOrder === "asc" ? "asc" : "desc",
         createTypes: parseList(raw.createTypes === "val" ? null : raw.createTypes, DEFAULT_TYPES),
-        pageSize: clamp(raw.pageSize, 5, 100, 20),
+        pageSize: clamp(raw.pageSize, 5, 100, 25),
         // 0 or empty: grow with the content and let the page scroll, like the built-in timeline
         height: raw.height && raw.height > 0 ? clamp(raw.height, 240, 4000, 760) : 0,
         density: raw.density === "compact" ? "compact" : "comfortable",

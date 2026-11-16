@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <manifest>
-  <control namespace="Sandsor" constructor="ActivityTimeline" version="0.3.2" display-name-key="Control_Name" description-key="Control_Description" control-type="virtual" >
+  <control namespace="Sandsor" constructor="ActivityTimeline" version="0.3.3" display-name-key="Control_Name" description-key="Control_Description" control-type="virtual" >
     <external-service-usage enabled="false">
     </external-service-usage>
 
@@ -53,7 +53,7 @@
       <value name="asc" display-name-key="SortOrder_Asc">asc</value>
     </property>
     <property name="createTypes" display-name-key="CreateTypes_Name" description-key="CreateTypes_Description" of-type="SingleLine.Text" usage="input" required="false" default-value="email,phonecall,task,appointment" />
-    <property name="pageSize" display-name-key="PageSize_Name" description-key="PageSize_Description" of-type="Whole.None" usage="input" required="false" default-value="20" />
+    <property name="pageSize" display-name-key="PageSize_Name" description-key="PageSize_Description" of-type="Whole.None" usage="input" required="false" default-value="25" />
     <property name="height" display-name-key="Height_Name" description-key="Height_Description" of-type="Whole.None" usage="input" required="false" default-value="0" />
     <property name="density" display-name-key="Density_Name" description-key="Density_Description" of-type="Enum" usage="input" required="false" default-value="comfortable">
       <value name="comfortable" display-name-key="Density_Comfortable">comfortable</value>
