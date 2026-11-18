@@ -239,9 +239,9 @@ request (see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)).
 - **Writes:** it only writes when the user acts: by saving a note, or by changing or closing an activity.
 - **Email bodies:** shown in a sandboxed frame that can't run scripts. Remote images are blocked until the user
   chooses to show them.
-- **Stored in the browser:** the user's view preferences per table (sort, density, filters) and the time they
-  last opened each record, in the browser's local storage. For the browser session, which records have more
-  activities than fit on one page, in session storage.
+- **Stored in the browser:** the user's view preferences per table (sort, density, filters) and the time of their
+  last visit to each of their 500 most recently opened records, in the browser's local storage. For the browser
+  session, which records have more activities than fit on one page, in session storage.
 
 ## Performance
 

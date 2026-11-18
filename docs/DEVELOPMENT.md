@@ -48,9 +48,13 @@ pac pcf push --solution-unique-name YourDevSolution
 ## Build the solution
 
 ```powershell
+Remove-Item -Recurse -Force src/ActivityTimeline/out -ErrorAction SilentlyContinue
 cd solution
 dotnet build -c Release
 ```
+
+Remove `src/ActivityTimeline/out` first: the solution build reuses whatever is there, so a development build left by
+`npm run build` would end up in the zips. A production `bundle.js` is about 200 KB; a development one is over 3 MB.
 
 The output in `solution/bin/Release/` is `ActivityTimeline.zip` (unmanaged) and `ActivityTimeline_managed.zip`
 (managed).

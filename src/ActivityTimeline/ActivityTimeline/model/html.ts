@@ -146,7 +146,7 @@ const QUOTE_START_SELECTORS = [
     "blockquote",
 ];
 
-const QUOTED_CLASS = "rsn-quoted";
+const QUOTED_CLASS = "crm-quoted";
 
 /**
  * Marks the quoted part of a reply (from the first quote marker to the end of its container) so it can be hidden.

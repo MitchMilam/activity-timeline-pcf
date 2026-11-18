@@ -54,7 +54,10 @@ interface Prefs {
     onlyMine?: boolean;
 }
 
-const PREFIX = "rsn-activitytimeline";
+const PREFIX = "crm-activitytimeline";
+
+/** Last visits are kept, in one entry per user, for the records they opened most recently */
+const SEEN_LIMIT = 500;
 
 /**
  * Notes follow the user's choice when it's created on or last updated; with the maker's activity sort
@@ -88,9 +91,15 @@ function writeJson(key: string, value: unknown): void {
     }
 }
 
+function readVisits(key: string): Record<string, number> {
+    const visits = readJson<Record<string, number>>(key);
+    return visits && typeof visits === "object" ? visits : {};
+}
+
 export function useTimeline(source: TimelineDataSource, config: TimelineConfig, record: RecordContext | undefined): [TimelineState, TimelineActions] {
     const prefsKey = `${PREFIX}:prefs:${record?.entity ?? "none"}`;
-    const seenKey = record ? `${PREFIX}:seen:${record.entity}:${record.id}:${source.currentUserId}` : undefined;
+    const seenKey = `${PREFIX}:seen:${source.currentUserId}`;
+    const visitKey = record ? `${record.entity}:${record.id}` : undefined;
 
     const initial = React.useMemo<TimelineState>(() => {
         const prefs = readJson<Prefs>(prefsKey) ?? {};
@@ -110,7 +119,7 @@ export function useTimeline(source: TimelineDataSource, config: TimelineConfig, 
                 status: prefs.status ?? defaults.status ?? "all",
                 onlyMine: prefs.onlyMine ?? defaults.onlyMine ?? false,
             },
-            lastSeen: seenKey ? readJson<number>(seenKey) : undefined,
+            lastSeen: visitKey ? readVisits(seenKey)[visitKey] : undefined,
         };
     }, []); // once per mount
 
@@ -125,8 +134,11 @@ export function useTimeline(source: TimelineDataSource, config: TimelineConfig, 
 
     // Remember the visit; the badge threshold for this session stays what it was when the timeline opened
     React.useEffect(() => {
-        if (seenKey) writeJson(seenKey, Date.now());
-    }, [seenKey]);
+        if (!visitKey) return;
+        const visits = { ...readVisits(seenKey), [visitKey]: Date.now() };
+        const kept = Object.keys(visits).sort((a, b) => visits[b] - visits[a]).slice(0, SEEN_LIMIT);
+        writeJson(seenKey, Object.fromEntries(kept.map((k) => [k, visits[k]])));
+    }, [seenKey, visitKey]);
 
     const applyPage = React.useCallback(
         (request: number, page: PageResult, upcoming?: PageResult) => {

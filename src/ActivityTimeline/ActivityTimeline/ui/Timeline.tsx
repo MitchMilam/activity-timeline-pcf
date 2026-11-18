@@ -342,7 +342,7 @@ const TimelineView: React.FC<{ record?: RecordContext }> = ({ record }) => {
         <div
             className={styles.root}
             // Day headers pin below the top block when the page scrolls; inside a fixed-height box they pin at its top
-            style={{ height: fixedHeight ? config.height : undefined, ["--rsn-tl-top" as string]: fixedHeight ? "0px" : `${topHeight}px` } as React.CSSProperties}
+            style={{ height: fixedHeight ? config.height : undefined, ["--crm-tl-top" as string]: fixedHeight ? "0px" : `${topHeight}px` } as React.CSSProperties}
             onKeyDown={onKeyDown}
         >
             <div className={styles.top} ref={setTopEl}>

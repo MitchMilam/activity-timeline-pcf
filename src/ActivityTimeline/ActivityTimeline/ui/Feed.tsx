@@ -26,7 +26,7 @@ const useStyles = makeStyles({
     },
     dayHeader: {
         position: "sticky",
-        top: "var(--rsn-tl-top, 0px)",
+        top: "var(--crm-tl-top, 0px)",
         zIndex: 2,
         ...shorthands.padding(tokens.spacingVerticalS, "0", tokens.spacingVerticalXS),
         backgroundColor: tokens.colorNeutralBackground1,

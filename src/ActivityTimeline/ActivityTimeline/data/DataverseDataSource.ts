@@ -35,7 +35,7 @@ const NOTE_SELECT = "annotationid,subject,notetext,filename,filesize,mimetype,is
 /** When sorting by activity date, an activity can sit at any of these */
 const EVENT_DATE_COLUMNS: SortColumn[] = ["createdon", "scheduledstart", "scheduledend", "actualend"];
 /** Records with more activities than fit on a page, kept for the browser session so they go straight to paging */
-const LARGE_RECORDS = "rsn-activitytimeline:large";
+const LARGE_RECORDS = "crm-activitytimeline:large";
 
 // --- value helpers ----------------------------------------------------------------------------------------
 
